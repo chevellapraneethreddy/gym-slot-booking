@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import sqlite3 from 'sqlite3';
+import mongoose from 'mongoose';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import path from 'path';
@@ -17,154 +17,158 @@ app.use(express.json());
 // Serve static files from the React (Vite) build folder
 app.use(express.static(path.join(__dirname, "../client/dist")));
 
-// Database setup
-const dbPath = join(__dirname, 'gym_booking.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('Error opening database', err);
-    } else {
-        console.log('Connected to SQLite database');
-        initializeDatabase();
-    }
+// MongoDB Setup
+const MONGODB_URI = "mongodb+srv://chevellapraneethreddy46_db_user:MkonkXnBlHLH2KKy@slotbooking.kmdghhv.mongodb.net/gym_booking?appName=slotbooking";
+
+mongoose.connect(MONGODB_URI)
+  .then(() => {
+    console.log('Connected to MongoDB');
+    initializeDatabase();
+  })
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Schemas
+const slotSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  time: { type: String, required: true },
+  capacity: { type: Number, default: 10 }
 });
 
-function initializeDatabase() {
-    db.serialize(() => {
-        // Create Slots table
-        db.run(`CREATE TABLE IF NOT EXISTS slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            time TEXT NOT NULL,
-            capacity INTEGER DEFAULT 10
-        )`);
+const bookingSchema = new mongoose.Schema({
+  user_id: { type: String, required: true },
+  slot_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Slot', required: true }
+});
 
-        // Create Bookings table
-        db.run(`CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            slot_id INTEGER NOT NULL,
-            FOREIGN KEY (slot_id) REFERENCES slots (id),
-            UNIQUE(user_id, slot_id)
-        )`);
+// Ensure unique booking per user per slot
+bookingSchema.index({ user_id: 1, slot_id: 1 }, { unique: true });
 
-        // Seed slots if empty
-        db.get("SELECT COUNT(*) as count FROM slots", (err, row) => {
-            if (row.count === 0) {
-                const slots = [
-                    { name: 'HIIT Blast', time: '06:00 AM - 07:00 AM' },
-                    { name: 'Power Yoga', time: '07:00 AM - 08:00 AM' },
-                    { name: 'Cardio Burn', time: '08:00 AM - 09:00 AM' },
-                    { name: 'Strength Training', time: '09:00 AM - 10:00 AM' },
-                    { name: 'Zumba Dance', time: '04:00 PM - 05:00 PM' },
-                    { name: 'CrossFit Challenge', time: '05:00 PM - 06:00 PM' },
-                    { name: 'Pilates Flow', time: '06:00 PM - 07:00 PM' },
-                    { name: 'Evening Stretch', time: '07:00 PM - 08:00 PM' }
-                ];
-                const stmt = db.prepare("INSERT INTO slots (name, time) VALUES (?, ?)");
-                slots.forEach(slot => stmt.run(slot.name, slot.time));
-                stmt.finalize();
-                console.log('Seeded initial slots with names');
-            }
-        });
-    });
+const Slot = mongoose.model('Slot', slotSchema);
+const Booking = mongoose.model('Booking', bookingSchema);
+
+async function initializeDatabase() {
+  try {
+    const count = await Slot.countDocuments();
+    if (count === 0) {
+      const initialSlots = [
+        { name: 'HIIT Blast', time: '06:00 AM - 07:00 AM' },
+        { name: 'Power Yoga', time: '07:00 AM - 08:00 AM' },
+        { name: 'Cardio Burn', time: '08:00 AM - 09:00 AM' },
+        { name: 'Strength Training', time: '09:00 AM - 10:00 AM' },
+        { name: 'Zumba Dance', time: '04:00 PM - 05:00 PM' },
+        { name: 'CrossFit Challenge', time: '05:00 PM - 06:00 PM' },
+        { name: 'Pilates Flow', time: '06:00 PM - 07:00 PM' },
+        { name: 'Evening Stretch', time: '07:00 PM - 08:00 PM' }
+      ];
+      await Slot.insertMany(initialSlots);
+      console.log('Seeded initial slots in MongoDB');
+    }
+  } catch (err) {
+    console.error('Initial seeding error:', err);
+  }
 }
 
 // Routes
 
 // GET /api/slots -> fetch all slots with booking count
-app.get('/api/slots', (req, res) => {
-    const query = `
-        SELECT s.*, COUNT(b.id) as booked_count 
-        FROM slots s 
-        LEFT JOIN bookings b ON s.id = b.slot_id 
-        GROUP BY s.id
-    `;
-    db.all(query, [], (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-        res.json(rows);
-    });
+app.get('/api/slots', async (req, res) => {
+  try {
+    const slots = await Slot.find().lean();
+    
+    // Get booking counts for each slot
+    const slotsWithCounts = await Promise.all(slots.map(async (slot) => {
+      const booked_count = await Booking.countDocuments({ slot_id: slot._id });
+      return {
+        ...slot,
+        id: slot._id.toString(), // Map _id to id for frontend compatibility
+        booked_count
+      };
+    }));
+    
+    res.json(slotsWithCounts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/my-bookings/:user_id -> fetch detailed bookings for a specific user
-app.get('/api/my-bookings/:user_id', (req, res) => {
+app.get('/api/my-bookings/:user_id', async (req, res) => {
+  try {
     const { user_id } = req.params;
-    const query = `
-        SELECT s.*, b.id as booking_id
-        FROM bookings b
-        JOIN slots s ON b.slot_id = s.id
-        WHERE b.user_id = ?
-    `;
-    db.all(query, [user_id], (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-        res.json(rows);
-    });
+    const bookings = await Booking.find({ user_id }).populate('slot_id').lean();
+    
+    // Map to a format compatible with frontend
+    const userBookings = bookings.map(b => ({
+      ...b.slot_id,
+      id: b.slot_id._id.toString(),
+      booking_id: b._id.toString()
+    }));
+    
+    res.json(userBookings);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/book -> book a slot
-app.post('/api/book', (req, res) => {
+app.post('/api/book', async (req, res) => {
+  try {
     const { user_id, slot_id } = req.body;
 
     if (!user_id || !slot_id) {
-        return res.status(400).json({ error: 'User ID and Slot ID are required' });
+      return res.status(400).json({ error: 'User ID and Slot ID are required' });
     }
 
     // 1. Check if user already booked this slot
-    db.get("SELECT id FROM bookings WHERE user_id = ? AND slot_id = ?", [user_id, slot_id], (err, row) => {
-        if (row) {
-            return res.status(400).json({ error: 'You have already booked this slot' });
-        }
+    const existing = await Booking.findOne({ user_id, slot_id });
+    if (existing) {
+      return res.status(400).json({ error: 'You have already booked this slot' });
+    }
 
-        // 2. Check capacity
-        const capQuery = `
-            SELECT s.capacity, COUNT(b.id) as booked_count 
-            FROM slots s 
-            LEFT JOIN bookings b ON s.id = b.slot_id 
-            WHERE s.id = ? 
-            GROUP BY s.id
-        `;
-        db.get(capQuery, [slot_id], (err, row) => {
-            if (err) return res.status(500).json({ error: err.message });
-            if (!row) return res.status(404).json({ error: 'Slot not found' });
+    // 2. Check capacity
+    const slot = await Slot.findById(slot_id);
+    if (!slot) return res.status(404).json({ error: 'Slot not found' });
 
-            if (row.booked_count >= row.capacity) {
-                return res.status(400).json({ error: 'Slot is full' });
-            }
+    const bookedCount = await Booking.countDocuments({ slot_id });
+    if (bookedCount >= slot.capacity) {
+      return res.status(400).json({ error: 'Slot is full' });
+    }
 
-            // 3. Book the slot
-            db.run("INSERT INTO bookings (user_id, slot_id) VALUES (?, ?)", [user_id, slot_id], function(err) {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({ message: 'Booking successful', id: this.lastID });
-            });
-        });
-    });
+    // 3. Book the slot
+    const newBooking = new Booking({ user_id, slot_id });
+    await newBooking.save();
+    
+    res.json({ message: 'Booking successful', id: newBooking._id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // DELETE /api/cancel -> cancel a booking
-app.delete('/api/cancel', (req, res) => {
+app.delete('/api/cancel', async (req, res) => {
+  try {
     const { user_id, slot_id } = req.body;
 
     if (!user_id || !slot_id) {
-        return res.status(400).json({ error: 'User ID and Slot ID are required' });
+      return res.status(400).json({ error: 'User ID and Slot ID are required' });
     }
 
-    db.run("DELETE FROM bookings WHERE user_id = ? AND slot_id = ?", [user_id, slot_id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        if (this.changes === 0) {
-            return res.status(404).json({ error: 'Booking not found' });
-        }
-        res.json({ message: 'Booking cancelled successfully' });
-    });
+    const result = await Booking.deleteOne({ user_id, slot_id });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    
+    res.json({ message: 'Booking cancelled successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Fallback route for React SPA (Express 5 compatible catch-all)
+// Fallback route for React SPA
 app.use((req, res) => {
-    res.sendFile(path.join(__dirname, "../client/dist/index.html"));
+  const indexPath = path.join(__dirname, "../client/dist/index.html");
+  res.sendFile(indexPath);
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
